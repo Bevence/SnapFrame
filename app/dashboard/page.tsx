@@ -44,13 +44,36 @@ export default function Dashboard() {
         e.preventDefault();
     };
 
-    const handleGenerate = () => {
+    const handleGenerate = async () => {
         if (!file) return;
         setStatus('processing');
-        // Simulate API call to generate thumbnails
-        setTimeout(() => {
+        
+        try {
+            const { getSignedUploadUrl } = await import('../actions/s3');
+            const { success, url, key, error } = await getSignedUploadUrl(file.name, file.type);
+            
+            if (!success || !url) {
+                throw new Error(error || "Failed to get presigned URL.");
+            }
+            
+            // Upload file directly to S3
+            const uploadResponse = await fetch(url, {
+                method: "PUT",
+                body: file,
+                headers: { "Content-Type": file.type },
+            });
+            
+            if (!uploadResponse.ok) {
+                throw new Error("S3 upload failed");
+            }
+            
+            // Upload successful, mark as done
             setStatus('done');
-        }, 2500);
+        } catch (err) {
+            console.error("Upload error:", err);
+            alert("Upload failed! Check console for errors.");
+            setStatus('idle');
+        }
     };
 
     const resolutions = [
