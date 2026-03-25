@@ -1,7 +1,13 @@
 "use client";
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
 import Image from 'next/image';
+
+interface DbFile {
+    id: string;
+    key: string;
+    created_at?: string;
+}
 import { createClient } from '../../utils/supabase/client';
 import { useRouter } from 'next/navigation';
 
@@ -18,6 +24,31 @@ export default function Dashboard() {
     const [preview, setPreview] = useState<string | null>(null);
     const [status, setStatus] = useState<'idle' | 'processing' | 'done'>('idle');
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const [dbFiles, setDbFiles] = useState<DbFile[]>([]);
+    const [isLoadingFiles, setIsLoadingFiles] = useState(true);
+    const [selectedImage, setSelectedImage] = useState<string | null>(null);
+    const [uploadedKey, setUploadedKey] = useState<string | null>(null);
+
+    const fetchFiles = async () => {
+        setIsLoadingFiles(true);
+        try {
+            const { data, error } = await supabase
+                .from('files')
+                .select('*')
+                .order('created_at', { ascending: false });
+
+            if (error) throw error;
+            if (data) setDbFiles(data as DbFile[]);
+        } catch (error) {
+            console.error("Error fetching files:", error);
+        } finally {
+            setIsLoadingFiles(false);
+        }
+    };
+
+    useEffect(() => {
+        fetchFiles();
+    }, []);
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         if (e.target.files && e.target.files[0]) {
@@ -46,33 +77,80 @@ export default function Dashboard() {
 
     const handleGenerate = async () => {
         if (!file) return;
-        setStatus('processing');
-        
+
+        setStatus("processing");
+
         try {
-            const { getSignedUploadUrl } = await import('../actions/s3');
-            const { success, url, key, error } = await getSignedUploadUrl(file.name, file.type);
-            
-            if (!success || !url) {
-                throw new Error(error || "Failed to get presigned URL.");
+            // 1️⃣ Get Supabase session token
+            const {
+                data: { session },
+            } = await supabase.auth.getSession();
+
+            if (!session?.access_token) {
+                throw new Error("User not authenticated");
             }
-            
-            // Upload file directly to S3
-            const uploadResponse = await fetch(url, {
+
+            const accessToken = session.access_token;
+
+            // 2️⃣ Request signed URL from Lambda via API Gateway
+            const response = await fetch(
+                `${process.env.NEXT_PUBLIC_API_URL}/generate-upload-url`,
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${accessToken}`,
+                    },
+                    body: JSON.stringify({
+                        fileName: file.name,
+                        fileType: file.type,
+                    }),
+                }
+            );
+
+            // 3️⃣ Check API Gateway response
+            if (!response.ok) {
+                const text = await response.text();
+                throw new Error(`Failed to get signed URL: ${text}`);
+            }
+
+            const { uploadUrl, key } = await response.json();
+            console.log('uploadUrl :>> ', uploadUrl);
+            console.log('key :>> ', key);
+
+            if (!uploadUrl || !key) {
+                throw new Error("Invalid signed URL response");
+            }
+
+            // 4️⃣ Upload directly to S3
+            const uploadResponse = await fetch(uploadUrl, {
                 method: "PUT",
+                headers: {
+                    "Content-Type": file.type,
+                },
                 body: file,
-                headers: { "Content-Type": file.type },
             });
-            
+
             if (!uploadResponse.ok) {
-                throw new Error("S3 upload failed");
+                const text = await uploadResponse.text();
+                throw new Error(`S3 upload failed: ${text}`);
             }
+
+            // ✅ Upload success
+            console.log("Uploaded key:", key);
+            setUploadedKey(key);
             
-            // Upload successful, mark as done
-            setStatus('done');
-        } catch (err) {
+            // ⏳ Processing delay: Give AWS Lambda time to generate the 3 thumbnails 
+            // before we transition to the 'done' state and try to load them from S3.
+            setTimeout(() => {
+                setStatus("done");
+                fetchFiles();
+            }, 3500);
+
+        } catch (err: any) {
             console.error("Upload error:", err);
-            alert("Upload failed! Check console for errors.");
-            setStatus('idle');
+            alert(err.message || "Upload failed");
+            setStatus("idle");
         }
     };
 
@@ -260,10 +338,10 @@ export default function Dashboard() {
                         <div className="flex flex-col md:flex-row items-start md:items-center justify-between mb-10 pb-8 border-b border-gray-800/80 gap-6">
                             <div>
                                 <h2 className="text-3xl font-extrabold text-white mb-2">Generated successfully</h2>
-                                <p className="text-gray-400 text-lg">6 perfectly optimized variations of <span className="text-gray-200 font-medium">{file?.name}</span></p>
+                                <p className="text-gray-400 text-lg">3 perfectly optimized variations of <span className="text-gray-200 font-medium">{file?.name}</span></p>
                             </div>
                             <button
-                                onClick={() => { setFile(null); setPreview(null); setStatus('idle'); }}
+                                onClick={() => { setFile(null); setPreview(null); setUploadedKey(null); setStatus('idle'); }}
                                 className="px-6 py-3 rounded-xl bg-gray-800 hover:bg-gray-700 text-white font-semibold transition-colors border border-gray-700 shadow-lg flex items-center gap-2 transform hover:-translate-y-0.5"
                             >
                                 <svg className="w-5 h-5 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -273,46 +351,88 @@ export default function Dashboard() {
                             </button>
                         </div>
 
-                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
-                            {resolutions.map((res, i) => (
-                                <div key={i} className="group backdrop-blur-md bg-gray-900/40 border border-gray-800 rounded-3xl overflow-hidden hover:bg-gray-800/80 hover:border-gray-600 transition-all duration-300 flex flex-col shadow-xl hover:shadow-[0_0_30px_rgba(0,0,0,0.5)]">
-                                    <div className="relative w-full aspect-video bg-gray-950 overflow-hidden flex items-center justify-center p-4">
-                                        {/* Checkerboard background inside the image container */}
-                                        <div className="absolute inset-0 opacity-20 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI4IiBoZWlnaHQ9IjgiPgo8cmVjdCB3aWR0aD0iOCIgaGVpZ2h0PSI4IiBmaWxsPSIjZmZmIiAvPgo8cGF0aCBkPSJNMCAwTDggOFpNOCAwTDAgOFoiIHN0cm9rZT0iIzAwMCIgc3Ryb2tlLXdpZHRoPSIxIiAvPgo8L3N2Zz4=')]"></div>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-8">
+                            {[
+                                { name: 'large', label: 'Large (800px)', color: 'from-blue-500/10 to-transparent border-blue-500/20' },
+                                { name: 'medium', label: 'Medium (400px)', color: 'from-purple-500/10 to-transparent border-purple-500/20' },
+                                { name: 'small', label: 'Small (150px)', color: 'from-pink-500/10 to-transparent border-pink-500/20' }
+                            ].map((size) => {
+                                const baseUrl = process.env.NEXT_PUBLIC_CLOUDFRONT_URL;
+                                
+                                const getThumbUrl = () => {
+                                    if (!uploadedKey) return '';
+                                    let thumbKey = uploadedKey;
+                                    if (thumbKey.startsWith('uploads/')) {
+                                        thumbKey = thumbKey.replace('uploads/', `thumbnails/${size.name}/`);
+                                    } else {
+                                        thumbKey = `thumbnails/${size.name}/${thumbKey}`;
+                                    }
+                                    thumbKey = thumbKey.replace(/\.[^/.]+$/, ".webp");
+                                    return `${baseUrl}/${thumbKey}`;
+                                };
 
-                                        <div
-                                            className="relative z-10 w-full h-full flex items-center justify-center"
-                                            style={{ aspectRatio: res.ratio !== 'auto' ? res.ratio : undefined }}
+                                return (
+                                    <div key={size.name} className={`flex flex-col p-6 rounded-3xl bg-gradient-to-b ${size.color} border border-gray-800/50 shadow-xl group`}>
+                                        <div 
+                                            className="relative w-full aspect-square bg-gray-950 rounded-2xl overflow-hidden border border-gray-800 shadow-inner cursor-pointer"
+                                            onClick={() => setSelectedImage(getThumbUrl())}
                                         >
+                                            <div className="absolute inset-0 opacity-20 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI4IiBoZWlnaHQ9IjgiPgo8cmVjdCB3aWR0aD0iOCIgaGVpZ2h0PSI4IiBmaWxsPSIjZmZmIiAvPgo8cGF0aCBkPSJNMCAwTDggOFpNOCAwTDAgOFoiIHN0cm9rZT0iIzAwMCIgc3Ryb2tlLXdpZHRoPSIxIiAvPgo8L3N2Zz4=')]"></div>
                                             {/* eslint-disable-next-line @next/next/no-img-element */}
                                             <img
-                                                src={preview}
-                                                alt={res.label}
-                                                className="max-h-full max-w-full object-cover rounded-md shadow-2xl group-hover:scale-105 transition-transform duration-700"
-                                                style={{ aspectRatio: res.ratio !== 'auto' ? res.ratio : undefined }}
-                                            />
-                                        </div>
+                                                src={getThumbUrl()}
+                                                alt={`${size.label} thumbnail`}
+                                                className="w-full h-full object-contain relative z-10 group-hover:scale-105 transition-transform duration-500"
+                                                loading="lazy"
+                                                onError={(e) => {
+                                                    e.currentTarget.style.display = 'none';
+                                                    e.currentTarget.parentElement?.classList.add('flex', 'flex-col', 'items-center', 'justify-center', 'animate-pulse', 'pointer-events-none');
+                                                    if (e.currentTarget.parentElement && e.currentTarget.parentElement.childElementCount < 3) {
+                                                        const span = document.createElement('span');
+                                                        span.className = 'text-indigo-400/80 text-sm font-medium z-10 mt-4';
+                                                        span.innerText = 'Processing thumbnail...';
 
-                                        <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-end p-5 z-20">
-                                            <button className="w-full py-3 bg-white hover:bg-gray-100 rounded-xl text-sm font-bold text-gray-900 flex items-center justify-center gap-2 transition-transform transform hover:scale-102">
+                                                        const icon = document.createElement('div');
+                                                        icon.innerHTML = '<svg class="w-10 h-10 text-indigo-500/50" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" /></svg>';
+                                                        icon.className = 'z-10 animate-bounce';
+
+                                                        e.currentTarget.parentElement.appendChild(icon);
+                                                        e.currentTarget.parentElement.appendChild(span);
+                                                    }
+                                                }}
+                                            />
+                                            <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity z-20 flex items-center justify-center">
+                                                <svg className="w-10 h-10 text-white opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v3m0 0v3m0-3h3m-3 0H7" />
+                                                </svg>
+                                            </div>
+                                        </div>
+                                        <div className="mt-6 flex flex-col items-center justify-center">
+                                            <p className="text-lg font-bold text-gray-200">{size.label}</p>
+                                            <div className="flex gap-2 mt-2">
+                                                <span className="px-2 py-1 text-xs font-mono font-bold bg-white/5 rounded-md border border-white/10 uppercase tracking-wider text-gray-400">.WEBP</span>
+                                            </div>
+                                        </div>
+                                        <div className="mt-6">
+                                            <a 
+                                                href={getThumbUrl()}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="w-full py-3 bg-white/10 hover:bg-white/20 rounded-xl text-sm font-bold text-white flex items-center justify-center gap-2 transition-colors border border-white/5"
+                                                onClick={(e) => {
+                                                    // Prevent opening modal if clicking download
+                                                    e.stopPropagation();
+                                                }}
+                                            >
                                                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                                                 </svg>
-                                                Download {res.size}
-                                            </button>
+                                                Download image
+                                            </a>
                                         </div>
                                     </div>
-                                    <div className="p-6 flex-1 flex flex-col bg-gradient-to-b from-gray-900/50 to-transparent">
-                                        <div className="flex justify-between items-start mb-3 gap-2">
-                                            <h4 className="text-xl font-bold text-gray-100 line-clamp-1">{res.label}</h4>
-                                            <span className="text-xs font-mono font-bold bg-indigo-500/10 text-indigo-400 px-2.5 py-1 rounded-lg border border-indigo-500/20 whitespace-nowrap">
-                                                {res.size}
-                                            </span>
-                                        </div>
-                                        <p className="text-sm text-gray-500">{res.desc}</p>
-                                    </div>
-                                </div>
-                            ))}
+                                );
+                            })}
                         </div>
 
                         <div className="mt-16 text-center border-t border-gray-800/80 pt-12 pb-8">
@@ -325,7 +445,185 @@ export default function Dashboard() {
                         </div>
                     </div>
                 )}
+
+                {/* Gallery Section */}
+                <div className="w-full max-w-6xl mt-16 pt-16 border-t border-gray-800/80">
+                    <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-8 gap-4">
+                        <div>
+                            <h2 className="text-3xl font-extrabold text-white mb-2">Upload Gallery</h2>
+                            <p className="text-gray-400">All your original images and generated thumbnails</p>
+                        </div>
+                        <button
+                            onClick={fetchFiles}
+                            className="p-3 rounded-xl bg-gray-800 hover:bg-gray-700 text-white transition-colors border border-gray-700 shadow-lg flex items-center justify-center group shrink-0"
+                            title="Refresh Gallery"
+                        >
+                            <svg className={`w-5 h-5 ${isLoadingFiles ? 'animate-spin text-indigo-400' : 'opacity-80 group-hover:text-indigo-400'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                        </button>
+                    </div>
+
+                    {isLoadingFiles && dbFiles.length === 0 ? (
+                        <div className="flex justify-center py-12">
+                            <div className="w-8 h-8 border-2 border-indigo-500 rounded-full border-t-transparent animate-spin"></div>
+                        </div>
+                    ) : dbFiles.length === 0 ? (
+                        <div className="text-center py-16 bg-gray-900/40 rounded-3xl border border-gray-800/50">
+                            <svg className="w-16 h-16 text-gray-700 mx-auto mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                            </svg>
+                            <p className="text-gray-400 text-lg">No images found. Upload your first image above!</p>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-1 gap-12">
+                            {dbFiles.map((dbFile) => {
+                                const baseUrl = process.env.NEXT_PUBLIC_CLOUDFRONT_URL;
+
+                                const originalUrl = `${baseUrl}/${dbFile.key}`;
+
+                                // Generate thumbnail keys based on the lambda logic
+                                // Lambda: key.replace("uploads/", `thumbnails/${size.name}/`).replace(/\.[^/.]+$/, ".webp")
+                                const getThumbUrl = (size: string) => {
+                                    if (!dbFile.key) return '';
+                                    let thumbKey = dbFile.key;
+                                    if (thumbKey.startsWith('uploads/')) {
+                                        thumbKey = thumbKey.replace('uploads/', `thumbnails/${size}/`);
+                                    } else {
+                                        thumbKey = `thumbnails/${size}/${thumbKey}`;
+                                    }
+                                    thumbKey = thumbKey.replace(/\.[^/.]+$/, ".webp");
+                                    return `${baseUrl}/${thumbKey}`;
+                                };
+
+                                return (
+                                    <div key={dbFile.id} className="backdrop-blur-md bg-gray-900/40 border border-gray-800 rounded-3xl p-6 md:p-8 shadow-xl hover:shadow-[0_0_40px_rgba(0,0,0,0.3)] hover:border-gray-700 transition-all duration-300">
+                                        <div className="flex flex-col lg:flex-row gap-8">
+                                            {/* Original Image */}
+                                            <div className="w-full lg:w-1/3 flex flex-col">
+                                                <h4 className="text-lg font-bold text-gray-200 mb-4 flex items-center gap-2">
+                                                    <span className="w-2 h-2 rounded-full bg-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.8)]"></span>
+                                                    Original Image
+                                                </h4>
+                                                <div 
+                                                    className="relative aspect-square bg-gray-950 rounded-2xl overflow-hidden border border-gray-800 group shadow-inner cursor-pointer"
+                                                    onClick={() => setSelectedImage(originalUrl)}
+                                                >
+                                                    <div className="absolute inset-0 opacity-20 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI4IiBoZWlnaHQ9IjgiPgo8cmVjdCB3aWR0aD0iOCIgaGVpZ2h0PSI4IiBmaWxsPSIjZmZmIiAvPgo8cGF0aCBkPSJNMCAwTDggOFpNOCAwTDAgOFoiIHN0cm9rZT0iIzAwMCIgc3Ryb2tlLXdpZHRoPSIxIiAvPgo8L3N2Zz4=')]"></div>
+                                                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                                                    <img src={originalUrl} alt="Original" className="w-full h-full object-contain relative z-10 group-hover:scale-105 transition-transform duration-700" loading="lazy" />
+                                                    <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity z-20 flex items-center justify-center">
+                                                        <svg className="w-8 h-8 text-white opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v3m0 0v3m0-3h3m-3 0H7" />
+                                                        </svg>
+                                                    </div>
+                                                </div>
+                                                <div className="mt-4 p-3 bg-gray-950/50 rounded-xl border border-gray-800/80">
+                                                    <p className="text-xs font-mono text-gray-400 break-all leading-relaxed" title={dbFile.key}>
+                                                        {dbFile.key}
+                                                    </p>
+                                                    {dbFile.created_at && (
+                                                        <p className="text-xs text-gray-500 mt-2">
+                                                            {new Date(dbFile.created_at).toLocaleString()}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            </div>
+
+                                            {/* Thumbnails */}
+                                            <div className="w-full lg:w-2/3 flex flex-col">
+                                                <h4 className="text-lg font-bold text-gray-200 mb-4 flex items-center gap-2">
+                                                    <span className="w-2 h-2 rounded-full bg-fuchsia-500 shadow-[0_0_10px_rgba(217,70,239,0.8)]"></span>
+                                                    Generated Thumbnails (.webp)
+                                                </h4>
+                                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 h-full">
+                                                    {[
+                                                        { name: 'large', label: 'Large (800px)', color: 'from-blue-500/10 to-transparent border-blue-500/20' },
+                                                        { name: 'medium', label: 'Medium (400px)', color: 'from-purple-500/10 to-transparent border-purple-500/20' },
+                                                        { name: 'small', label: 'Small (150px)', color: 'from-pink-500/10 to-transparent border-pink-500/20' }
+                                                    ].map((size) => (
+                                                        <div key={size.name} className={`flex flex-col p-4 rounded-2xl bg-gradient-to-b ${size.color} border border-gray-800/50`}>
+                                                            <div 
+                                                                className="relative w-full aspect-square bg-gray-950 rounded-xl overflow-hidden border border-gray-800 shadow-inner group cursor-pointer"
+                                                                onClick={() => setSelectedImage(getThumbUrl(size.name))}
+                                                            >
+                                                                <div className="absolute inset-0 opacity-20 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI4IiBoZWlnaHQ9IjgiPgo8cmVjdCB3aWR0aD0iOCIgaGVpZ2h0PSI4IiBmaWxsPSIjZmZmIiAvPgo8cGF0aCBkPSJNMCAwTDggOFpNOCAwTDAgOFoiIHN0cm9rZT0iIzAwMCIgc3Ryb2tlLXdpZHRoPSIxIiAvPgo8L3N2Zz4=')]"></div>
+                                                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                                                <img
+                                                                    src={getThumbUrl(size.name)}
+                                                                    alt={`${size.label} thumbnail`}
+                                                                    className="w-full h-full object-contain relative z-10 group-hover:scale-105 transition-transform duration-500"
+                                                                    loading="lazy"
+                                                                    onError={(e) => {
+                                                                        e.currentTarget.style.display = 'none';
+                                                                        e.currentTarget.parentElement?.classList.add('flex', 'flex-col', 'items-center', 'justify-center', 'animate-pulse', 'pointer-events-none');
+                                                                        if (e.currentTarget.parentElement && e.currentTarget.parentElement.childElementCount < 3) {
+                                                                            const span = document.createElement('span');
+                                                                            span.className = 'text-indigo-400/80 text-sm font-medium z-10 mt-2';
+                                                                            span.innerText = 'Processing...';
+
+                                                                            const icon = document.createElement('div');
+                                                                            icon.innerHTML = '<svg class="w-8 h-8 text-indigo-500/50" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" /></svg>';
+                                                                            icon.className = 'z-10 animate-bounce';
+
+                                                                            e.currentTarget.parentElement.appendChild(icon);
+                                                                            e.currentTarget.parentElement.appendChild(span);
+                                                                        }
+                                                                    }}
+                                                                />
+                                                                <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity z-20 flex items-center justify-center">
+                                                                    <svg className="w-8 h-8 text-white opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v3m0 0v3m0-3h3m-3 0H7" />
+                                                                    </svg>
+                                                                </div>
+                                                            </div>
+                                                            <div className="mt-4 text-center">
+                                                                <p className="text-sm font-bold text-gray-300">{size.label}</p>
+                                                                <p className="text-xs text-gray-500 mt-1 uppercase tracking-wider font-mono">.WEBP</p>
+                                                            </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                </div>
             </main>
+
+            {/* Lightbox Modal */}
+            {selectedImage && (
+                <div 
+                    className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm p-4 md:p-12 animate-fade-in"
+                    onClick={() => setSelectedImage(null)}
+                >
+                    <button 
+                        className="absolute top-6 right-6 p-2 rounded-full bg-gray-800/80 text-white hover:bg-gray-700 transition flex items-center justify-center z-50 hover:scale-110 active:scale-95"
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedImage(null);
+                        }}
+                    >
+                        <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                    <div 
+                        className="relative w-full h-full max-w-7xl max-h-full flex items-center justify-center"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img 
+                            src={selectedImage as string} 
+                            alt="View enlarged" 
+                            className="max-w-full max-h-full object-contain drop-shadow-[0_0_40px_rgba(0,0,0,0.8)] rounded-xl"
+                        />
+                    </div>
+                </div>
+            )}
 
             {/* Required for fading effect map */}
             <style dangerouslySetInnerHTML={{
